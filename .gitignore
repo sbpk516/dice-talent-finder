@@ -1,6 +1,13 @@
 # Dependencies
 node_modules/
 
+# Python virtual environments
+crawl4ai-env/
+venv/
+env/
+.venv/
+.env/
+
 # Environment variables
 .env
 

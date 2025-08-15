@@ -5,7 +5,10 @@
   "type": "module",
   "main": "src/main.js",
   "scripts": {
-    "start": "node src/main.js"
+    "start": "node src/main.js",
+    "talent-finder": "node src/talent-finder-pipeline.js",
+    "github-search": "node src/github-talent-finder.js",
+    "example": "node src/example-usage.js"
   },
   "keywords": [
     "ai",
@@ -18,8 +21,9 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "openai": "^5.10.2",
-    "dotenv": "^17.2.1"
+    "dotenv": "^17.2.1",
+    "node-fetch": "^3.3.2",
+    "openai": "^5.10.2"
   },
   "engines": {
     "node": ">=18.0.0"
