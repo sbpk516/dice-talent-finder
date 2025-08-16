@@ -1,8 +1,9 @@
-// src/scrapers/github-crawler.js
+// src/scrapers/github-crawler-monitored.js
 
 import fetch from 'node-fetch';
+import { getPerformanceMonitor } from '../utils/performance-monitor.js';
 
-class GitHubCrawler {
+class GitHubCrawlerMonitored {
     constructor(apiToken = null) {
         this.apiToken = apiToken || process.env.GITHUB_TOKEN;
         this.baseUrl = 'https://api.github.com';
@@ -14,14 +15,20 @@ class GitHubCrawler {
         if (this.apiToken) {
             this.headers['Authorization'] = `token ${this.apiToken}`;
         }
+        
+        this.monitor = getPerformanceMonitor();
+        this.cache = new Map(); // Simple in-memory cache
     }
 
     async searchCandidates(jobRequirements) {
+        this.monitor.startOperation('GitHub Candidate Search');
+        
         console.log('🔍 Searching GitHub for candidates...');
         
         const candidates = [];
-        const searchQueries = await this.buildSearchQueries(jobRequirements);
+        const searchQueries = this.buildSearchQueries(jobRequirements);
         
+        this.monitor.startOperation('User Search Queries');
         for (const query of searchQueries) {
             try {
                 const results = await this.searchUsers(query);
@@ -30,24 +37,30 @@ class GitHubCrawler {
                 console.error(`Error searching with query "${query}":`, error.message);
             }
         }
+        this.monitor.endOperation('User Search Queries');
         
         // Remove duplicates and enrich candidate data
+        this.monitor.startOperation('Candidate Deduplication');
         const uniqueCandidates = this.removeDuplicates(candidates);
+        this.monitor.endOperation('Candidate Deduplication');
+        
+        this.monitor.startOperation('Candidate Enrichment');
         const enrichedCandidates = await this.enrichCandidates(uniqueCandidates, jobRequirements);
+        this.monitor.endOperation('Candidate Enrichment');
         
         // Score and rank candidates
+        this.monitor.startOperation('Candidate Scoring');
         const scoredCandidates = this.scoreCandidates(enrichedCandidates, jobRequirements);
+        this.monitor.endOperation('Candidate Scoring');
+        
+        this.monitor.endOperation('GitHub Candidate Search');
         
         return scoredCandidates.slice(0, 20); // Return top 20 candidates
     }
 
-    async buildSearchQueries(jobRequirements) {
-        // Use AI-powered optimized queries if available
-        if (jobRequirements.optimizedQueries) {
-            return jobRequirements.optimizedQueries;
-        }
+    buildSearchQueries(jobRequirements) {
+        this.monitor.startOperation('Query Building');
         
-        // Fallback to traditional approach
         const queries = [];
         const { requiredSkills, preferredSkills, level, yearsExperience } = jobRequirements;
         
@@ -77,49 +90,90 @@ class GitHubCrawler {
             queries.push(`${tech} language:Python`);
         }
         
+        this.monitor.endOperation('Query Building');
         return queries;
     }
 
     async searchUsers(query) {
-        const url = `${this.baseUrl}/search/users?q=${encodeURIComponent(query)}&sort=followers&order=desc&per_page=30`;
+        const cacheKey = `search:${query}`;
         
-        const response = await fetch(url, { headers: this.headers });
-        
-        if (!response.ok) {
-            throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+        // Check cache first
+        if (this.cache.has(cacheKey)) {
+            console.log(`📦 Cache hit for query: ${query.substring(0, 50)}...`);
+            return this.cache.get(cacheKey);
         }
         
-        const data = await response.json();
-        return data.items || [];
+        const startTime = Date.now();
+        const url = `${this.baseUrl}/search/users?q=${encodeURIComponent(query)}&sort=followers&order=desc&per_page=30`;
+        
+        try {
+            const response = await fetch(url, { headers: this.headers });
+            
+            if (!response.ok) {
+                throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+            }
+            
+            const data = await response.json();
+            const duration = Date.now() - startTime;
+            
+            this.monitor.trackApiCall('GitHub Search API', duration);
+            
+            // Cache the result
+            this.cache.set(cacheKey, data.items || []);
+            
+            return data.items || [];
+            
+        } catch (error) {
+            const duration = Date.now() - startTime;
+            this.monitor.trackApiCall('GitHub Search API (Failed)', duration);
+            throw error;
+        }
     }
 
     async enrichCandidates(candidates, jobRequirements) {
         console.log(`📊 Enriching data for ${candidates.length} candidates...`);
         
         const enriched = [];
+        const batchSize = 5; // Process in batches to avoid overwhelming the API
         
-        for (const candidate of candidates) {
-            try {
-                const detailedProfile = await this.getUserProfile(candidate.login);
-                const repositories = await this.getUserRepositories(candidate.login);
-                const contributions = await this.getUserContributions(candidate.login);
-                
-                enriched.push({
-                    ...candidate,
-                    profile: detailedProfile,
-                    repositories,
-                    contributions,
-                    skills: this.extractSkills(repositories, detailedProfile),
-                    experience: this.calculateExperience(detailedProfile, repositories),
-                    location: detailedProfile.location,
-                    hireable: detailedProfile.hireable
-                });
-                
-                // Rate limiting - GitHub allows 30 requests per minute for authenticated users
-                await this.delay(1000);
-                
-            } catch (error) {
-                console.error(`Error enriching candidate ${candidate.login}:`, error.message);
+        for (let i = 0; i < candidates.length; i += batchSize) {
+            const batch = candidates.slice(i, i + batchSize);
+            
+            this.monitor.startOperation(`Enrichment Batch ${Math.floor(i/batchSize) + 1}`);
+            
+            const batchPromises = batch.map(async (candidate) => {
+                try {
+                    const [detailedProfile, repositories, contributions] = await Promise.all([
+                        this.getUserProfile(candidate.login),
+                        this.getUserRepositories(candidate.login),
+                        this.getUserContributions(candidate.login)
+                    ]);
+                    
+                    return {
+                        ...candidate,
+                        profile: detailedProfile,
+                        repositories,
+                        contributions,
+                        skills: this.extractSkills(repositories, detailedProfile),
+                        experience: this.calculateExperience(detailedProfile, repositories),
+                        location: detailedProfile.location,
+                        hireable: detailedProfile.hireable
+                    };
+                    
+                } catch (error) {
+                    console.error(`Error enriching candidate ${candidate.login}:`, error.message);
+                    return null;
+                }
+            });
+            
+            const batchResults = await Promise.all(batchPromises);
+            enriched.push(...batchResults.filter(result => result !== null));
+            
+            this.monitor.endOperation(`Enrichment Batch ${Math.floor(i/batchSize) + 1}`);
+            
+            // Rate limiting - GitHub allows 30 requests per minute for authenticated users
+            if (i + batchSize < candidates.length) {
+                await this.delay(2000); // 2 second delay between batches
             }
         }
         
@@ -127,41 +181,110 @@ class GitHubCrawler {
     }
 
     async getUserProfile(username) {
-        const url = `${this.baseUrl}/users/${username}`;
-        const response = await fetch(url, { headers: this.headers });
+        const cacheKey = `profile:${username}`;
         
-        if (!response.ok) {
-            throw new Error(`Failed to get profile for ${username}: ${response.status}`);
+        if (this.cache.has(cacheKey)) {
+            return this.cache.get(cacheKey);
         }
         
-        return await response.json();
+        const startTime = Date.now();
+        const url = `${this.baseUrl}/users/${username}`;
+        
+        try {
+            const response = await fetch(url, { headers: this.headers });
+            
+            if (!response.ok) {
+                throw new Error(`Failed to get profile for ${username}: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            const duration = Date.now() - startTime;
+            
+            this.monitor.trackApiCall('GitHub Profile API', duration);
+            
+            // Cache the result
+            this.cache.set(cacheKey, data);
+            
+            return data;
+            
+        } catch (error) {
+            const duration = Date.now() - startTime;
+            this.monitor.trackApiCall('GitHub Profile API (Failed)', duration);
+            throw error;
+        }
     }
 
     async getUserRepositories(username) {
-        const url = `${this.baseUrl}/users/${username}/repos?sort=updated&per_page=20`;
-        const response = await fetch(url, { headers: this.headers });
+        const cacheKey = `repos:${username}`;
         
-        if (!response.ok) {
-            throw new Error(`Failed to get repositories for ${username}: ${response.status}`);
+        if (this.cache.has(cacheKey)) {
+            return this.cache.get(cacheKey);
         }
         
-        return await response.json();
+        const startTime = Date.now();
+        const url = `${this.baseUrl}/users/${username}/repos?sort=updated&per_page=20`;
+        
+        try {
+            const response = await fetch(url, { headers: this.headers });
+            
+            if (!response.ok) {
+                throw new Error(`Failed to get repositories for ${username}: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            const duration = Date.now() - startTime;
+            
+            this.monitor.trackApiCall('GitHub Repos API', duration);
+            
+            // Cache the result
+            this.cache.set(cacheKey, data);
+            
+            return data;
+            
+        } catch (error) {
+            const duration = Date.now() - startTime;
+            this.monitor.trackApiCall('GitHub Repos API (Failed)', duration);
+            throw error;
+        }
     }
 
     async getUserContributions(username) {
-        // Note: GitHub API doesn't provide direct access to contribution graph
-        // We'll use repository activity as a proxy
-        const url = `${this.baseUrl}/users/${username}/events?per_page=30`;
-        const response = await fetch(url, { headers: this.headers });
+        const cacheKey = `contributions:${username}`;
         
-        if (!response.ok) {
-            return [];
+        if (this.cache.has(cacheKey)) {
+            return this.cache.get(cacheKey);
         }
         
-        return await response.json();
+        const startTime = Date.now();
+        const url = `${this.baseUrl}/users/${username}/events?per_page=30`;
+        
+        try {
+            const response = await fetch(url, { headers: this.headers });
+            
+            if (!response.ok) {
+                return [];
+            }
+            
+            const data = await response.json();
+            const duration = Date.now() - startTime;
+            
+            this.monitor.trackApiCall('GitHub Events API', duration);
+            
+            // Cache the result
+            this.cache.set(cacheKey, data);
+            
+            return data;
+            
+        } catch (error) {
+            const duration = Date.now() - startTime;
+            this.monitor.trackApiCall('GitHub Events API (Failed)', duration);
+            return [];
+        }
     }
 
     extractSkills(repositories, profile) {
+        this.monitor.startOperation('Skills Extraction');
+        
         const skills = new Set();
         
         // Extract from repository languages
@@ -192,10 +315,13 @@ class GitHubCrawler {
             }
         });
         
+        this.monitor.endOperation('Skills Extraction');
         return Array.from(skills);
     }
 
     calculateExperience(profile, repositories) {
+        this.monitor.startOperation('Experience Calculation');
+        
         const createdAt = new Date(profile.created_at);
         const now = new Date();
         const yearsSinceJoin = (now - createdAt) / (1000 * 60 * 60 * 24 * 365);
@@ -213,6 +339,8 @@ class GitHubCrawler {
             experienceLevel = 'mid';
         }
         
+        this.monitor.endOperation('Experience Calculation');
+        
         return {
             yearsSinceJoin: Math.round(yearsSinceJoin * 10) / 10,
             totalStars,
@@ -223,7 +351,9 @@ class GitHubCrawler {
     }
 
     scoreCandidates(candidates, jobRequirements) {
-        return candidates.map(candidate => {
+        this.monitor.startOperation('Candidate Scoring');
+        
+        const scored = candidates.map(candidate => {
             let score = 0;
             const { requiredSkills, preferredSkills, level, yearsExperience } = jobRequirements;
             
@@ -282,6 +412,9 @@ class GitHubCrawler {
                 }
             };
         }).sort((a, b) => b.score - a.score);
+        
+        this.monitor.endOperation('Candidate Scoring');
+        return scored;
     }
 
     removeDuplicates(candidates) {
@@ -316,6 +449,16 @@ class GitHubCrawler {
             publicRepos: candidate.public_repos
         };
     }
+
+    // Method to get performance report
+    getPerformanceReport() {
+        return this.monitor.getSummary();
+    }
+
+    // Method to print performance report
+    printPerformanceReport() {
+        this.monitor.printReport();
+    }
 }
 
-export default GitHubCrawler;
+export default GitHubCrawlerMonitored;
